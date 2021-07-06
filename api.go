@@ -4,9 +4,11 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
 )
 
@@ -14,7 +16,7 @@ import (
 type HTTPHandler func(w http.ResponseWriter, r *http.Request)
 
 // AuthCallback is the function called when doing bearer authentication
-type AuthCallback func(token string) (id string, err error)
+type AuthCallback func(token string, req *http.Request) (payload interface{}, err error)
 
 // Controller runs the controller
 type Controller struct {
@@ -23,6 +25,13 @@ type Controller struct {
 	useDefaultMiddleware bool
 	AuthCallback         AuthCallback
 }
+type key int
+
+const (
+	// KeyAuthID returns the context Value of the Auth set by the defaultAuthMiddleware func on successful auth
+	KeyAuthID key = iota
+	// ...
+)
 
 // NewController creates a new HTTP API controller
 func NewController() *Controller {
@@ -40,10 +49,19 @@ func (c *Controller) AddHandler(path string, fn HTTPHandler, methods ...string) 
 
 // Run runs the controller and the listener
 func (c *Controller) Run(addr string) {
+
+	allowed_origins := os.Getenv("ORIGIN_ALLOWED")
+	if len(allowed_origins) == 0 {
+		allowed_origins = "*"
+	}
+	headersOk := handlers.AllowedHeaders([]string{"X-Requested-With", "Authorization"})
+	originsOk := handlers.AllowedOrigins([]string{allowed_origins})
+	methodsOk := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "OPTIONS"})
+
 	if c.useDefaultMiddleware {
 		c.router.Use(c.defaultAuthMiddleware)
 	}
-	c.server = &http.Server{Addr: addr, Handler: c.router}
+	c.server = &http.Server{Addr: addr, Handler: handlers.CORS(headersOk, originsOk, methodsOk)(c.router)}
 
 	log.Println("Running at http://" + addr)
 	// log.Fatal(http.ListenAndServe(addr, nil))
@@ -70,13 +88,12 @@ func (c *Controller) setMiddleware(h ...mux.MiddlewareFunc) {
 func (c *Controller) defaultAuthMiddleware(next http.Handler) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-
+		ctx := r.Context()
 		// if there's no auth callback then skip auth
 		if c.AuthCallback == nil {
-			next.ServeHTTP(w, r)
+			next.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
-		w.Header().Set("X-ID", "")
 
 		header := r.Header.Get("Authorization")
 		parts := strings.Split(header, " ")
@@ -89,16 +106,17 @@ func (c *Controller) defaultAuthMiddleware(next http.Handler) http.Handler {
 		token := parts[1]
 
 		fn := c.AuthCallback
-		id, err := fn(token)
+		id, err := fn(token, r)
 		if err != nil {
-			w.Header().Add("X-Error", err.Error())
+			w.Header().Set("X-Error", err.Error())
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("X-ID", id)
+		ctx = context.WithValue(ctx, KeyAuthID, id)
+		// w.Header().Set("X-ID", id)
 
 		// continue from here
-		next.ServeHTTP(w, r)
+		next.ServeHTTP(w, r.WithContext(ctx))
 		return
 	})
 }
